@@ -75,50 +75,14 @@ class WideResNet(nn.Module):
                 m.bias.data.zero_()
             elif isinstance(m, nn.Linear):
                 m.bias.data.zero_()
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.block1(out)
+        out = self.block2(out)
+        out = self.block3(out)
+        out = self.relu(self.bn1(out))
 
-
-    def channel_mix(self, out, rand_index, lam):
-        _, c = out.size()
-        ratio = int(c*lam)
-        
-        temp = out.clone()
-        
-        trans_out = out[rand_index, ratio:]
-        temp[:, ratio:] = trans_out[:, :]
-
-        return temp
-
-    def forward(self, x, is_train, rand_index=0, lam=0):
-        
-        if is_train:
-            out = self.conv1(x)
-
-            out = self.block1(out)
-            
-
-            out = self.block2(out)
-            #out = self.channel_mix(out, rand_index, lam)
-            
-            out = self.block3(out)
-            out = self.relu(self.bn1(out))
-            #out = self.channel_mix(out, rand_index, lam)
-
-            out = F.avg_pool2d(out, 8)
-            out = out.view(-1, self.nChannels)
-            out = self.channel_mix(out, rand_index, lam)
-
-            out = self.fc(out)
-            return out
-
-        else:
-            out = self.conv1(x)
-
-            out = self.block1(out)
-            out = self.block2(out)            
-            out = self.block3(out)
-            out = self.relu(self.bn1(out))
-
-            out = F.avg_pool2d(out, 8)
-            out = out.view(-1, self.nChannels)
-            out = self.fc(out)
-            return out
+        out = F.avg_pool2d(out, 8)
+        out = out.view(-1, self.nChannels)
+        out = self.fc(out)
+        return out

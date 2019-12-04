@@ -1,9 +1,7 @@
 '''ResNet18/34/50/101/152 in Pytorch.'''
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
 
 from torch.autograd import Variable
 
@@ -29,24 +27,12 @@ class BasicBlock(nn.Module):
                 nn.BatchNorm2d(self.expansion*planes)
             )
 
-    def channel_mix(self, out, rand_index, ratio):
-
-        channel = out.size(1)
-        x = out.clone()
-        channel = int(channel * ratio)
-        temp = out[rand_index, channel:, :, :]
-        x[:, channel:, :, :] = temp
-        
-        return out
-
     def forward(self, x):
-
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
         out = F.relu(out)
         return out
-
 
 
 class Bottleneck(nn.Module):
@@ -68,22 +54,9 @@ class Bottleneck(nn.Module):
                 nn.BatchNorm2d(self.expansion*planes)
             )
 
-    def channel_mix(self, out, rand_index, ratio):
-
-        channel = out.size(1)
-        channel = int(channel * ratio)
-  
-        temp = out[rand_index, channel:, :, :]
-        out[:, channel:, :, :] = temp
-
-        return out
-
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
-
         out = F.relu(self.bn2(self.conv2(out)))
-        #out = self.channel_mix(out, rand_)
-
         out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
         out = F.relu(out)
@@ -102,7 +75,6 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
         self.linear = nn.Linear(512*block.expansion, num_classes)
-        #self.inlinear = nn.Bilinear(512-int(512*lam), 512-int(512*lam), 512-int(512*lam))
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
@@ -112,72 +84,17 @@ class ResNet(nn.Module):
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-
-    def channel_mix(self, out, rand_index, lam):
-        _, c, _, _ = out.size()
-        ratio = int(c*lam)
-        
-        temp = out.clone()
-        
-        trans_out = out[rand_index, ratio:]
-        temp[:, ratio:] = trans_out[:, :]
-
-        return temp
-        
-
-    def forward(self, x, is_train, rand_index=0, lam=0):
-        lam = 1. - lam
-
-        if is_train == True:
-            layer_mix = random.randint(0,6)
-
-            if layer_mix == 0:
-                x = self.channel_mix(x, rand_index, lam)
-            
-            f = self.conv1(x)
-            out = F.relu(self.bn1(self.conv1(x)))
-            
-            if layer_mix == 1:
-                out = self.channel_mix(out, rand_index, lam)
-            
-            out = self.layer1(out) # b, 64, 32, 32
-            
-            if layer_mix == 2:
-                out = self.channel_mix(out, rand_index, lam)
-
-            out = self.layer2(out) # b, 128, 16, 16
-            if layer_mix == 3:
-                out = self.channel_mix(out, rand_index, lam)
-
-            out = self.layer3(out) # b, 256, 8, 8
-            if layer_mix == 4:
-                out = self.channel_mix(out, rand_index, lam)
-
-            out = self.layer4(out) # b, 512, 4, 4
-            
-            if layer_mix == 5:
-                out = self.channel_mix(out, rand_index, lam)
-            
-            out = F.avg_pool2d(out, 4)
-            
-            if layer_mix == 6:
-                out = self.channel_mix(out, rand_index, lam)
-            
-            out = out.view(out.size(0), -1)
-            out = self.linear(out)
-            return out
-
-        elif is_train == False:
-            out = F.relu(self.bn1(self.conv1(x))) # b, 64, 32, 32
-            out = self.layer1(out)
-            out = self.layer2(out)
-            out = self.layer3(out)
-            out = self.layer4(out)
-
-            out = F.avg_pool2d(out, 4)
-            out = out.view(out.size(0), -1)
-            out = self.linear(out)
-            return out
+    def forward(self, x):
+        f = self.conv1(x)
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = F.avg_pool2d(out, 4)
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        return out
 
 
 def ResNet18(num_classes=10):
