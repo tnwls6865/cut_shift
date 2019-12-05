@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 
 
 class BasicBlock(nn.Module):
@@ -78,35 +79,35 @@ class WideResNet(nn.Module):
 
 
     def channel_mix(self, out, rand_index, lam):
-        _, c = out.size()
-        ratio = int(c*lam)
-        
-        temp = out.clone()
-        
-        trans_out = out[rand_index, ratio:]
-        temp[:, ratio:] = trans_out[:, :]
 
-        return temp
+        out = out*lam + out[rand_index]*(1-lam)
+        return out
 
     def forward(self, x, is_train, rand_index=0, lam=0):
         
         if is_train:
+            
+            layer_mix = random.randint(0,3)
+
             out = self.conv1(x)
+            if layer_mix == 0:
+                out = self.channel_mix(out, rand_index, lam)
 
             out = self.block1(out)
-            
+            if layer_mix == 1:
+                out = self.channel_mix(out, rand_index, lam)
 
             out = self.block2(out)
-            #out = self.channel_mix(out, rand_index, lam)
+            if layer_mix == 2:
+                out = self.channel_mix(out, rand_index, lam)
             
             out = self.block3(out)
             out = self.relu(self.bn1(out))
-            #out = self.channel_mix(out, rand_index, lam)
+            if layer_mix == 3:
+                out = self.channel_mix(out, rand_index, lam)
 
             out = F.avg_pool2d(out, 8)
             out = out.view(-1, self.nChannels)
-            out = self.channel_mix(out, rand_index, lam)
-
             out = self.fc(out)
             return out
 

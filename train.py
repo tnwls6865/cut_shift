@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import warnings
 from tqdm import tqdm
+from sklearn import preprocessing
 
 import torch
 import torch.nn as nn
@@ -25,12 +26,12 @@ from tensorboardX import SummaryWriter
 warnings.filterwarnings("ignore")
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model_options = ['resnet18', 'resnet34', 'resnet50', 'wideresnet']
-dataset_options = ['cifar10', 'cifar100', 'svhn', 'fashion_mnist']
+dataset_options = ['cifar10', 'cifar100', 'svhn']
 
 parser = argparse.ArgumentParser(description='CNN')
-parser.add_argument('--dataset', '-d', default='cifar10',
+parser.add_argument('--dataset', '-d', default='cifar100',
                     choices=dataset_options)
-parser.add_argument('--model_type', '-a', default='resnet18',
+parser.add_argument('--model_type', '-a', default='wideresnet',
                     choices=model_options)
 parser.add_argument('--batch_size', type=int, default=64,
                     help='input batch size for training (default: 128)')
@@ -55,7 +56,7 @@ parser.add_argument('--mix_prob', default=1.0, type=float,
 
 
 def main():
-    global args, lam
+    global args, lb
     
     args = parser.parse_args()
     torch.manual_seed(args.seed)
@@ -66,9 +67,11 @@ def main():
     csv_path = 'logs/'
     csv_path = os.path.join(csv_path, 'batch_' + str(args.batch_size))
     print(csv_path)
-    model_path = 'checkpoints/'
-    tensorboard_path = 'runs/'
-    writer = SummaryWriter(tensorboard_path)
+    model_path = 'checkpoints'
+    tensorboard_path = 'runs'
+
+    summary = SummaryWriter(tensorboard_path)
+
     if not os.path.exists(csv_path):
         os.makedirs(csv_path)
     if not os.path.exists(model_path):
@@ -79,19 +82,17 @@ def main():
     # setting test_id
     test_id = str(args.dataset) + '_' + str(args.model_type) 
     if args.featuremix:
-        test_id = test_id + '_changechannel'
+        test_id = test_id + '_random_channel_mixing'
     test_id = test_id + '_lr_' + str(args.lr) 
 
  
     
+    lb = preprocessing.LabelBinarizer()
 
     # setting dataset
     if args.dataset == 'svhn':
         normalize = transforms.Normalize(mean=[x / 255.0 for x in[109.9, 109.7, 113.8]],
                                         std=[x / 255.0 for x in [50.1, 50.6, 50.8]])
-    elif args.dataset == 'fashion_mnist':
-        normalize = transforms.Normalize(mean=(0.5,), std=(0.5,))
-
     else:
         normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                                         std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
@@ -127,18 +128,6 @@ def main():
                                         train=False,
                                         transform=test_transform,
                                         download=True)
-    elif args.dataset == 'fashion_mnist':
-        num_classes = 10
-        train_dataset = datasets.FashionMNIST(root='data/',
-                                              train=True,
-                                              transform=train_transform,
-                                              download=True)
-        # Download and load the test data
-        test_dataset = datasets.FashionMNIST(root='data/',
-                                             train=False,
-                                             transform=test_transform,
-                                             download=True)
-        
     elif args.dataset == 'svhn':
         num_classes = 10
         train_dataset = datasets.SVHN(root='data/',
@@ -162,6 +151,9 @@ def main():
                                     transform=test_transform,
                                     download=True)
 
+    lb.fit(list(train_dataset.class_to_idx.values()))
+
+
     # data loader 
     train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                                 batch_size=args.batch_size,
@@ -174,7 +166,7 @@ def main():
                                                 shuffle=False,
                                                 pin_memory=True,
                                                 num_workers=0)
-    
+
     # model setting 
     if args.model_type == 'resnet18':
         model = ResNet18(num_classes=num_classes)
@@ -198,12 +190,11 @@ def main():
     # loss and hyperparameter
     model = model.cuda()
     criterion = nn.CrossEntropyLoss().cuda()
-    #optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.lr_decay, nesterov=True)
-    #lr_step_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.1) # Decay LR by a factor of 0.1 every step_size
-    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min')
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0) # Gradient Clipping
 
     if args.dataset == 'svhn':
@@ -219,20 +210,20 @@ def main():
         progress_bar = tqdm(train_loader)
         
         train_acc, train_loss = train(progress_bar, model, criterion, optimizer, epoch)
-
+       
         test_acc, test_loss = test(test_loader, model, criterion)
 
-        writer.add_scalar('wideresnet/train_loss', (train_loss/len(train_loader)), epoch)
-        writer.add_scalar('wideresnet/train_acc', train_acc, epoch)
-
-        writer.add_scalar('wideresnet/test_loss', test_loss, epoch)
-        writer.add_scalar('wideresnet/test_acc', test_acc, epoch)
+        summary.add_scalar('train/loss3', train_loss/len(train_loader), epoch)
+        summary.add_scalar('train/acc3', train_acc, epoch)
+        summary.add_scalar('test/loss3', test_loss, epoch)
+        summary.add_scalar('test/acc3', test_acc, epoch)
 
         tqdm.write('test_loss: %.3f' % (test_loss))
         tqdm.write('test_acc: %.3f' % (test_acc))
 
         train_loss = '%.3f' % (train_loss/len(train_loader))
         test_loss = '%.3f' % (test_loss)
+
 
         scheduler.step(epoch)
 
@@ -251,29 +242,31 @@ def train(progress_bar, model, criterion, optimizer, epoch):
     xentropy_loss_avg = 0.
     correct = 0.
     total = 0.
-    bbox = []
 
     for i, (images, labels) in enumerate(progress_bar):
         progress_bar.set_description('Epoch ' + str(epoch))
 
         images = images.cuda()
         labels = labels.cuda()
+        one_hot_labels = lb.transform(labels.tolist())
+        one_hot_labels = torch.tensor(one_hot_labels)
 
         r = np.random.rand(1)
         if args.beta > 0 and r < args.mix_prob:
+            
             is_train = True
-            
-            lam = np.random.beta(args.beta, args.beta)  
-            
+            lam = np.random.beta(args.beta, args.beta)
             rand_index = torch.randperm(images.size()[0]).cuda()
 
-            label_a = labels
+            label_a = labels 
             label_b = labels[rand_index]
+            
             bbox = rand_bbox(images.size(), lam)
 
 
             images[:, :, bbox[0]:bbox[2], bbox[1]:bbox[3]] = images[rand_index, :, bbox[0]:bbox[2], bbox[1]:bbox[3]]
             lam = 1 - ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / (images.size()[-1] * images.size()[-2]))
+            
             
             # compute output
             input_var = torch.autograd.Variable(images, requires_grad=True)
@@ -281,8 +274,8 @@ def train(progress_bar, model, criterion, optimizer, epoch):
             label_b_var = torch.autograd.Variable(label_b)
 
             output = model(input_var, is_train, rand_index, lam)
-            loss = criterion(output, label_a_var) *lam + criterion(output, label_b_var) * (1. - lam)
-        
+            loss = criterion(output, label_a_var) * lam + criterion(output, label_b_var)
+
         else:
             is_train = False
             input_var = torch.autograd.Variable(images, requires_grad=True)
@@ -301,7 +294,7 @@ def train(progress_bar, model, criterion, optimizer, epoch):
         total += labels.size(0)
         correct += (output == labels.data).sum().item()
         accuracy = correct / total
-        #train_loss = xentropy_loss_avg / total
+        train_loss = xentropy_loss_avg / total
 
         progress_bar.set_postfix(xentropy='%.3f' % (xentropy_loss_avg / (i + 1)), acc='%.3f' % accuracy)
 
@@ -322,7 +315,7 @@ def test(loader, model, criterion):
         labels = labels.cuda()
 
         with torch.no_grad():
-            pred = model(images, is_train, 0)
+            pred = model(images, is_train, 0, 0)
 
         val_loss = criterion(pred, labels)
         loss += val_loss.item()

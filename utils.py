@@ -46,5 +46,5 @@ class CSVLogger():
 
 
 def save_checkpoint(state, model_path, test_id):
-    filename = model_path + test_id +'.pth.tar'
+    filename = model_path + '/' + test_id +'.pth.tar'
     torch.save(state, filename)

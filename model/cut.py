@@ -131,34 +131,26 @@ class ResNet(nn.Module):
 
         return bbx1, bby1, bbx2, bby2
 
-    def channel_mix(self, out, rand_index, lam):
-            #indices = np.random.permutation(out.size(0))
-        # out = out*lam + out[indices]*(1-lam)
-        # target_shuffled_onehot = target_reweighted[indices]
-        # target_reweighted = target_reweighted * lam + target_shuffled_onehot * (1 - lam)
-
-        #channel = out.size(1) # 64
-        #ratio = int(channel * lam) # channel ratio
-        # _, c, _, _ = out.size()
-        # temp = out.clone()
-        # ratio = int(c*lam)
+    '''def feature_mix (self, out, size1, size2, rand_index, bbox):
+        out_gap = size2 /  size1
+        bbx1, bby1, bbx2, bby2 =  int(bbox[0]*out_gap), int(bbox[1]*out_gap), int(bbox[2]*out_gap), int(bbox[3]*out_gap)
+        out_a = out[rand_index, :, bbx1:bbx2, bby1:bby2]
+        out[:, :, bbx1:bbx2, bby1:bby2] = out_a
         
-        # shuffle_out =  out[rand_index, (c-ratio):]
-        # temp[:, (c-ratio):] = shuffle_out
-        #out = out*lam*c + shuffle_out*(1-lam)*(1-c)
+        return out '''
+    def channel_mix(self, out, rand_index, lam):
 
         out = out*lam + out[rand_index]*(1-lam)
         
         return out
 
     def forward(self, x, is_train, rand_index, lam=0):
-        #lam = 1 - lam
         if is_train == True:
             layer_mix = random.randint(0,6)
-
+            
             if layer_mix == 0:
                 x = self.channel_mix(x, rand_index, lam)
-            
+
             f = self.conv1(x)
             out = F.relu(self.bn1(self.conv1(x)))
             
@@ -169,26 +161,27 @@ class ResNet(nn.Module):
             
             if layer_mix == 2:
                 out = self.channel_mix(out, rand_index, lam)
-
+            
             out = self.layer2(out) # b, 128, 16, 16
+            
             if layer_mix == 3:
                 out = self.channel_mix(out, rand_index, lam)
 
             out = self.layer3(out) # b, 256, 8, 8
+            
             if layer_mix == 4:
                 out = self.channel_mix(out, rand_index, lam)
-
+            
             out = self.layer4(out) # b, 512, 4, 4
             
             if layer_mix == 5:
                 out = self.channel_mix(out, rand_index, lam)
-            
+    
             out = F.avg_pool2d(out, 4)
-            
+            out = out.view(out.size(0), -1)
             if layer_mix == 6:
                 out = self.channel_mix(out, rand_index, lam)
-            
-            out = out.view(out.size(0), -1)
+
             out = self.linear(out)
             return out
 
