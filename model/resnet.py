@@ -1,9 +1,8 @@
 '''ResNet18/34/50/101/152 in Pytorch.'''
-import numpy as np
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import random
 
 from torch.autograd import Variable
 
@@ -29,24 +28,12 @@ class BasicBlock(nn.Module):
                 nn.BatchNorm2d(self.expansion*planes)
             )
 
-    def channel_mix(self, out, rand_index, ratio):
-
-        channel = out.size(1)
-        x = out.clone()
-        channel = int(channel * ratio)
-        temp = out[rand_index, channel:, :, :]
-        x[:, channel:, :, :] = temp
-        
-        return out
-
     def forward(self, x):
-
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
         out = F.relu(out)
         return out
-
 
 
 class Bottleneck(nn.Module):
@@ -68,22 +55,9 @@ class Bottleneck(nn.Module):
                 nn.BatchNorm2d(self.expansion*planes)
             )
 
-    def channel_mix(self, out, rand_index, ratio):
-
-        channel = out.size(1)
-        channel = int(channel * ratio)
-  
-        temp = out[rand_index, channel:, :, :]
-        out[:, channel:, :, :] = temp
-
-        return out
-
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
-
         out = F.relu(self.bn2(self.conv2(out)))
-        #out = self.channel_mix(out, rand_)
-
         out = self.bn3(self.conv3(out))
         out += self.shortcut(x)
         out = F.relu(out)
@@ -103,8 +77,6 @@ class ResNet(nn.Module):
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
         self.linear = nn.Linear(512*block.expansion, num_classes)
 
-        self.i = 0
-
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
@@ -113,97 +85,50 @@ class ResNet(nn.Module):
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-    def rand_bbox(self, size, lam):
-        W = size[2]
-        H = size[3]
-        cut_rat = np.sqrt(1. - lam)
-        cut_w = np.int(W * cut_rat)
-        cut_h = np.int(H * cut_rat)
-
-        # uniform
-        cx = np.random.randint(W)
-        cy = np.random.randint(H)
-
-        bbx1 = np.clip(cx - cut_w // 2, 0, W)
-        bby1 = np.clip(cy - cut_h // 2, 0, H)
-        bbx2 = np.clip(cx + cut_w // 2, 0, W)
-        bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-        return bbx1, bby1, bbx2, bby2
-
     def channel_mix(self, out, rand_index, lam):
-            #indices = np.random.permutation(out.size(0))
-        # out = out*lam + out[indices]*(1-lam)
-        # target_shuffled_onehot = target_reweighted[indices]
-        # target_reweighted = target_reweighted * lam + target_shuffled_onehot * (1 - lam)
-
-        #channel = out.size(1) # 64
-        #ratio = int(channel * lam) # channel ratio
-        # _, c, _, _ = out.size()
-        # temp = out.clone()
-        # ratio = int(c*lam)
-        
-        # shuffle_out =  out[rand_index, (c-ratio):]
-        # temp[:, (c-ratio):] = shuffle_out
-        #out = out*lam*c + shuffle_out*(1-lam)*(1-c)
 
         out = out*lam + out[rand_index]*(1-lam)
         
         return out
 
-    def forward(self, x, is_train, rand_index, lam=0):
-        #lam = 1 - lam
-        if is_train == True:
-            layer_mix = random.randint(0,6)
 
-            if layer_mix == 0:
-                x = self.channel_mix(x, rand_index, lam)
-            
-            f = self.conv1(x)
+    def forward(self, x, is_train=False, rand_index=0, lam=0):
+        if is_train == True:
+            layer_mix = random.randint(0,3)
+
             out = F.relu(self.bn1(self.conv1(x)))
             
+            out = self.layer1(out)
+            if layer_mix == 0:
+                x = self.channel_mix(x, rand_index, lam)
+
+            out = self.layer2(out)
             if layer_mix == 1:
                 out = self.channel_mix(out, rand_index, lam)
-            
-            out = self.layer1(out) # b, 64, 32, 32
-            
+
+            out = self.layer3(out)
             if layer_mix == 2:
                 out = self.channel_mix(out, rand_index, lam)
 
-            out = self.layer2(out) # b, 128, 16, 16
+            out = self.layer4(out)
             if layer_mix == 3:
                 out = self.channel_mix(out, rand_index, lam)
 
-            out = self.layer3(out) # b, 256, 8, 8
-            if layer_mix == 4:
-                out = self.channel_mix(out, rand_index, lam)
-
-            out = self.layer4(out) # b, 512, 4, 4
-            
-            if layer_mix == 5:
-                out = self.channel_mix(out, rand_index, lam)
-            
             out = F.avg_pool2d(out, 4)
-            
-            if layer_mix == 6:
-                out = self.channel_mix(out, rand_index, lam)
-            
             out = out.view(out.size(0), -1)
             out = self.linear(out)
-            return out
 
-        elif is_train == False:
-            f = self.conv1(x)
-            out = F.relu(self.bn1(self.conv1(x))) # b, 64, 32, 32
+        else:
+            out = F.relu(self.bn1(self.conv1(x)))
             out = self.layer1(out)
             out = self.layer2(out)
             out = self.layer3(out)
             out = self.layer4(out)
-
             out = F.avg_pool2d(out, 4)
             out = out.view(out.size(0), -1)
             out = self.linear(out)
-            return out
+            
+        return out
 
 
 def ResNet18(num_classes=10):

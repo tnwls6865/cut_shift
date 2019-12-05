@@ -31,9 +31,9 @@ dataset_options = ['cifar10', 'cifar100', 'svhn']
 parser = argparse.ArgumentParser(description='CNN')
 parser.add_argument('--dataset', '-d', default='cifar100',
                     choices=dataset_options)
-parser.add_argument('--model_type', '-a', default='wideresnet',
+parser.add_argument('--model_type', '-a', default='resnet18',
                     choices=model_options)
-parser.add_argument('--batch_size', type=int, default=64,
+parser.add_argument('--batch_size', type=int, default=4,
                     help='input batch size for training (default: 128)')
 parser.add_argument('--epochs', type=int, default=260,
                     help='number of epochs to train (default: 20)')
