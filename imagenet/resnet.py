@@ -1,5 +1,4 @@
-# Original code: https://github.com/pytorch/vision/blob/master/torchvision/models/resnet.py
-
+import random
 import torch.nn as nn
 import math
 
@@ -117,7 +116,7 @@ class ResNet(nn.Module):
             self.layer2 = self._make_layer(blocks[depth], 128, layers[depth][1], stride=2)
             self.layer3 = self._make_layer(blocks[depth], 256, layers[depth][2], stride=2)
             self.layer4 = self._make_layer(blocks[depth], 512, layers[depth][3], stride=2)
-            self.avgpool = nn.AvgPool2d(7) 
+            self.avgpool = nn.AvgPool2d(7)
             self.fc = nn.Linear(512 * blocks[depth].expansion, num_classes)
 
         for m in self.modules():
@@ -145,7 +144,16 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
+    def channel_mix(self, out, rand_index, lam):
+        temp = out.clone()
+        shuffle_temp = temp[rand_index]        
+
+        out = temp*lam + shuffle_temp*(1-lam)
+        
+        return out
+
+    def forward(self, x, is_train=False, rand_index=0, lam=0):
+        layer_mix = random.randint(0,3)
         if self.dataset == 'cifar10' or self.dataset == 'cifar100':
             x = self.conv1(x)
             x = self.bn1(x)
@@ -160,18 +168,45 @@ class ResNet(nn.Module):
             x = self.fc(x)
 
         elif self.dataset == 'imagenet':
-            x = self.conv1(x)
-            x = self.bn1(x)
-            x = self.relu(x)
-            x = self.maxpool(x)
+            if is_train ==True:
+                x = self.conv1(x)
+                x = self.bn1(x)
+                x = self.relu(x)
+                x = self.maxpool(x)
 
-            x = self.layer1(x)
-            x = self.layer2(x)
-            x = self.layer3(x)
-            x = self.layer4(x)
+                x = self.layer1(x)
+                if layer_mix == 0:
+                   x = self.channel_mix(x, rand_index, lam)
 
-            x = self.avgpool(x)
-            x = x.view(x.size(0), -1)
-            x = self.fc(x)
+                x = self.layer2(x)
+                if layer_mix == 1:
+                   x = self.channel_mix(x, rand_index, lam)
+
+                x = self.layer3(x)
+                if layer_mix == 2:
+                   x = self.channel_mix(x, rand_index, lam)
+
+                x = self.layer4(x)
+                if layer_mix == 3:
+                   x = self.channel_mix(x, rand_index, lam)
+
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+                x = self.fc(x)
+
+            else:
+                x = self.conv1(x)
+                x = self.bn1(x)
+                x = self.relu(x)
+                x = self.maxpool(x)
+
+                x = self.layer1(x)
+                x = self.layer2(x)
+                x = self.layer3(x)
+                x = self.layer4(x)
+
+                x = self.avgpool(x)
+                x = x.view(x.size(0), -1)
+                x = self.fc(x)
     
         return x
