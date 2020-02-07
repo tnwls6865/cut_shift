@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
 
 
 class BasicBlock(nn.Module):
@@ -45,8 +46,9 @@ class NetworkBlock(nn.Module):
         return self.layer(x)
 
 class WideResNet(nn.Module):
-    def __init__(self, depth, num_classes, widen_factor=1, dropRate=0.0):
+    def __init__(self, dataset, depth, num_classes, widen_factor=1, dropRate=0.0):
         super(WideResNet, self).__init__()
+        self.dataset = dataset
         nChannels = [16, 16*widen_factor, 32*widen_factor, 64*widen_factor]
         assert((depth - 4) % 6 == 0)
         n = (depth - 4) / 6
@@ -75,14 +77,53 @@ class WideResNet(nn.Module):
                 m.bias.data.zero_()
             elif isinstance(m, nn.Linear):
                 m.bias.data.zero_()
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.block1(out)
-        out = self.block2(out)
-        out = self.block3(out)
-        out = self.relu(self.bn1(out))
 
-        out = F.avg_pool2d(out, 8)
-        out = out.view(-1, self.nChannels)
-        out = self.fc(out)
+
+    def channel_mix(self, out, rand_index, lam):
+
+        out = out*lam + out[rand_index]*(1-lam)
         return out
+
+    def forward(self, x, is_train, rand_index=0, lam=0):
+        
+        if is_train:
+            
+            layer_mix = random.randint(0, 3)
+
+            out = self.conv1(x)
+            if layer_mix == 0:
+                out = self.channel_mix(out, rand_index, lam)
+
+            out = self.block1(out)
+            if layer_mix == 1:
+                out = self.channel_mix(out, rand_index, lam)
+
+            out = self.block2(out)
+            if layer_mix == 2:
+                out = self.channel_mix(out, rand_index, lam)
+            
+            out = self.block3(out)
+            out = self.relu(self.bn1(out))
+            if layer_mix == 3:
+                out = self.channel_mix(out, rand_index, lam)
+
+            if self.dataset.startswith('cifar'):
+                out = F.avg_pool2d(out, 8)
+            elif self.dataset.startswith('tiny'):
+                out = F.avg_pool2d(out, 16)
+            out = out.view(-1, self.nChannels)
+            out = self.fc(out)
+            return out
+
+        else:
+            out = self.conv1(x)
+
+            out = self.block1(out)
+            out = self.block2(out)            
+            out = self.block3(out)
+            out = self.relu(self.bn1(out))
+
+            out = F.avg_pool2d(out, 8)
+            out = out.view(-1, self.nChannels)
+            out = self.fc(out)
+            return out

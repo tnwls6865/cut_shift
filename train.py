@@ -1,334 +1,384 @@
-import os
-import pdb
+# original code: https://github.com/dyhan0920/PyramidNet-PyTorch/blob/master/train.py
+
 import argparse
-import numpy as np
-import warnings
-from tqdm import tqdm
-from sklearn import preprocessing
+import csv
+import os
+import shutil
+import time
 
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torch.backends.cudnn as cudnn
-from torch.optim.lr_scheduler import MultiStepLR
+import torch.optim
+import torch.utils.data
+import torch.utils.data.distributed
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torchvision.models as models
+import resnet as RN
+import wide_resnet as WN
+from utils import rand_bbox, save_checkpoint, AverageMeter, adjust_learning_rate, get_learning_rate, accuracy, CSVLogger, ColorJitter, Lighting
+import numpy as np
 
-import torchvision
-from torchvision.utils import make_grid
-from torchvision import datasets, transforms
-
-from utils import CSVLogger, rand_bbox, save_checkpoint
-
-from model.resnet import ResNet18, ResNet50, ResNet34
-from model.wide_resnet import WideResNet
-from tensorboardX import SummaryWriter
-
+import warnings
 
 warnings.filterwarnings("ignore")
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model_options = ['resnet18', 'resnet34', 'resnet50', 'wideresnet']
-dataset_options = ['cifar10', 'cifar100', 'svhn']
 
-parser = argparse.ArgumentParser(description='CNN')
-parser.add_argument('--dataset', '-d', default='cifar100',
-                    choices=dataset_options)
-parser.add_argument('--model_type', '-a', default='resnet18',
-                    choices=model_options)
-parser.add_argument('--batch_size', type=int, default=4,
-                    help='input batch size for training (default: 128)')
-parser.add_argument('--epochs', type=int, default=260,
-                    help='number of epochs to train (default: 20)')
-parser.add_argument('--lr', type=float, default=0.25,
-                    help='learning rate')
-parser.add_argument('--momentum', type=float, default=0.9,  metavar='M',
+model_names = sorted(name for name in models.__dict__
+                     if name.islower() and not name.startswith("__")
+                     and callable(models.__dict__[name]))
+
+parser = argparse.ArgumentParser(description='regularization CIFAR-10, CIFAR-100 and Tiny-imagenet Training')
+parser.add_argument('--net_type', default='resnet', type=str,
+                    help='networktype: resnet, and wide_resnet')
+parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+                    help='number of data loading workers (default: 4)')
+parser.add_argument('--epochs', default=250, type=int, metavar='N',
+                    help='number of total epochs to run')
+parser.add_argument('-b', '--batch_size', default=32, type=int,
+                    metavar='N', help='mini-batch size (default: 256)')
+parser.add_argument('--lr', '--learning-rate', default=0.25, type=float,
+                    metavar='LR', help='initial learning rate')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
-parser.add_argument('--seed', type=int, default=1,
-                    help='random seed (default: 1)')
-parser.add_argument('--resume', type=bool, default=False,
-                    help='restart')
-parser.add_argument('--lr_decay', type=float, default=1e-4,
-                     help='learning decay for lr scheduler')
-parser.add_argument('--featuremix', action='store_true', default=True,
-                     help='apply featuremix')
+parser.add_argument('--weight-decay', '--wd', default=1e-4, type=float,
+                    metavar='W', help='weight decay (default: 1e-4)')
+parser.add_argument('--print-freq', '-p', default=100, type=int,
+                    metavar='N', help='print frequency (default: 10)')
+parser.add_argument('--depth', default=18, type=int,
+                    help='depth of the network (default: 32)')
+parser.add_argument('--no-bottleneck', dest='bottleneck', action='store_false',
+                    help='to use basicblock for CIFAR datasets (default: bottleneck)')
+parser.add_argument('--dataset', dest='dataset', default='cifar10', type=str,
+                    help='dataset (options: cifar10, cifar100, and tiny)')
+parser.add_argument('--no-verbose', dest='verbose', action='store_false',
+                    help='to print the status at every iteration')
+parser.add_argument('--alpha', default=300, type=float,
+                    help='number of new channel increases per depth (default: 300)')
+parser.add_argument('--expname', default='Ours', type=str,
+                    help='name of experiment')
 parser.add_argument('--beta', default=1.0, type=float,
-                     help='beta distribution')
+                    help='hyperparameter beta')
 parser.add_argument('--mix_prob', default=1.0, type=float,
-                     help='learning decay for lr scheduler')
+                    help='cutmix probability')
+parser.add_argument('--resume', type=bool, default=False,
+                    help='restart')                   
 
+parser.set_defaults(bottleneck=True)
+parser.set_defaults(verbose=True)
+
+best_err1 = 100
+best_err5 = 100
+cudnn.benchmark = True
 
 def main():
-    global args, lb
-    
+    global args, best_err1, best_err5, start_epoch
+
     args = parser.parse_args()
-    torch.manual_seed(args.seed)
-    if device == 'cuda':
-        torch.cuda.manual_seed(args.seed)
 
-    # save file
+    test_id = args.net_type + '_' + str(args.depth) + '_' + args.dataset 
+
     csv_path = 'logs/'
-    csv_path = os.path.join(csv_path, 'batch_' + str(args.batch_size))
-    print(csv_path)
-    model_path = 'checkpoints'
-    tensorboard_path = 'runs'
-
-    summary = SummaryWriter(tensorboard_path)
+    csv_path = csv_path + test_id + '/'
+    checkpoint_path = 'runs/'
 
     if not os.path.exists(csv_path):
         os.makedirs(csv_path)
-    if not os.path.exists(model_path):
-        os.makedirs(model_path)
-    if not os.path.exists(tensorboard_path):
-        os.makedirs(tensorboard_path)
-    
-    # setting test_id
-    test_id = str(args.dataset) + '_' + str(args.model_type) 
-    if args.featuremix:
-        test_id = test_id + '_random_channel_mixing'
-    test_id = test_id + '_lr_' + str(args.lr) 
+    if not os.path.exists(checkpoint_path):
+        os.makedirs(checkpoint_path)
 
- 
-    
-    lb = preprocessing.LabelBinarizer()
-
-    # setting dataset
-    if args.dataset == 'svhn':
-        normalize = transforms.Normalize(mean=[x / 255.0 for x in[109.9, 109.7, 113.8]],
-                                        std=[x / 255.0 for x in [50.1, 50.6, 50.8]])
-    else:
+    if args.dataset.startswith('cifar'):
+        # Preprocessing
         normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-                                        std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
-    
-    # data augmentation
-    train_transform = transforms.Compose([])
-    train_transform.transforms.append(transforms.RandomCrop(32, padding=4))
-    train_transform.transforms.append(transforms.RandomHorizontalFlip())
-    train_transform.transforms.append(transforms.ToTensor())
-    train_transform.transforms.append(normalize)
+                                         std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
 
-    test_transform = transforms.Compose([transforms.ToTensor(),normalize])
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            normalize,
+        ])
 
-    if args.dataset == 'cifar10':
-        num_classes = 10
-        train_dataset = datasets.CIFAR10(root='data/',
-                                        train=True,
-                                        transform=train_transform,
-                                        download=True)
+        transform_test = transforms.Compose([
+            transforms.ToTensor(),
+            normalize
+        ])
 
-        test_dataset = datasets.CIFAR10(root='data/',
-                                        train=False,
-                                        transform=test_transform,
-                                        download=True)
-    elif args.dataset == 'cifar100':
-        num_classes = 100
-        train_dataset = datasets.CIFAR100(root='data/',
-                                        train=True,
-                                        transform=train_transform,
-                                        download=True)
+        # Dataloader 
+        if args.dataset == 'cifar100':
+            train_loader = torch.utils.data.DataLoader(
+                datasets.CIFAR100('./data', train=True, download=True, transform=transform_train),
+                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            val_loader = torch.utils.data.DataLoader(
+                datasets.CIFAR100('./data', train=False, transform=transform_test),
+                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            numberofclass = 100
 
-        test_dataset = datasets.CIFAR100(root='data/',
-                                        train=False,
-                                        transform=test_transform,
-                                        download=True)
-    elif args.dataset == 'svhn':
-        num_classes = 10
-        train_dataset = datasets.SVHN(root='data/',
-                                    split='train',
-                                    transform=train_transform,
-                                    download=True)
-
-        extra_dataset = datasets.SVHN(root='data/',
-                                    split='extra',
-                                    transform=train_transform,
-                                    download=True)
-
-        # Combine both training splits (https://arxiv.org/pdf/1605.07146.pdf)
-        data = np.concatenate([train_dataset.data, extra_dataset.data], axis=0)
-        labels = np.concatenate([train_dataset.labels, extra_dataset.labels], axis=0)
-        train_dataset.data = data
-        train_dataset.labels = labels
-
-        test_dataset = datasets.SVHN(root='data/',
-                                    split='test',
-                                    transform=test_transform,
-                                    download=True)
-
-    lb.fit(list(train_dataset.class_to_idx.values()))
-
-
-    # data loader 
-    train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
-                                                batch_size=args.batch_size,
-                                                shuffle=True,
-                                                pin_memory=True,
-                                                num_workers=0)
-
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
-                                                batch_size=args.batch_size,
-                                                shuffle=False,
-                                                pin_memory=True,
-                                                num_workers=0)
-
-    # model setting 
-    if args.model_type == 'resnet18':
-        model = ResNet18(num_classes=num_classes)
-    elif args.model_type == 'resnet34':
-        model = ResNet34(num_classes=num_classes)
-    elif args.model_type == 'resnet50':
-        model = ResNet50(num_classes=num_classes)
-    elif args.model_type == 'wideresnet':
-        if args.dataset == 'svhn':
-            model = WideResNet(depth=16, num_classes=num_classes, widen_factor=8,
-                            dropRate=0.4)
+        elif args.dataset == 'cifar10':
+            train_loader = torch.utils.data.DataLoader(
+                datasets.CIFAR10('./data', train=True, download=True, transform=transform_train),
+                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            val_loader = torch.utils.data.DataLoader(
+                datasets.CIFAR10('./data', train=False, transform=transform_test),
+                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            numberofclass = 10
         else:
-            model = WideResNet(depth=28, num_classes=num_classes, widen_factor=10,
-                            dropRate=0.3)
+            raise Exception('unknown dataset: {}'.format(args.dataset))
 
-    # checkpoint load
-    if args.resume:
-        checkpoint = torch.load('checkpoints/' + test_id + '.pt')
-        model.load_state_dict(checkpoint)
-    
-    # loss and hyperparameter
+    elif args.dataset == 'tiny':
+        # Image path
+        traindir = os.path.join('../../imagenet/train')
+        valdir = os.path.join('../../imagenet/val')
+
+        # Preprocessing
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+
+        jittering = ColorJitter(brightness=0.4, contrast=0.4,
+                                      saturation=0.4)
+        lighting = Lighting(alphastd=0.1,
+                                  eigval=[0.2175, 0.0188, 0.0045],
+                                  eigvec=[[-0.5675, 0.7192, 0.4009],
+                                          [-0.5808, -0.0045, -0.8140],
+                                          [-0.5836, -0.6948, 0.4203]])
+
+        # Dataloader 
+        train_dataset = datasets.ImageFolder(
+            traindir,
+            transforms.Compose([
+                transforms.RandomResizedCrop(64),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                jittering,
+                lighting,
+                normalize,
+            ]))
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=args.workers, pin_memory=True)
+
+        val_loader = torch.utils.data.DataLoader(
+            datasets.ImageFolder(valdir, transforms.Compose([
+                transforms.Resize(64),
+                transforms.CenterCrop(64),
+                transforms.ToTensor(),
+                normalize,
+            ])),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.workers, pin_memory=True)
+        
+        numberofclass = 200
+
+    else:
+        raise Exception('unknown dataset: {}'.format(args.dataset))
+
+    print("=> creating model '{}'".format(args.net_type))
+    if args.net_type == 'resnet':
+        model = RN.ResNet(args.dataset, args.depth, numberofclass, args.bottleneck)  # for ResNet
+    elif args.net_type == 'wide_resnet':
+        model = WN.WideResNet(args.dataset, depth=28, num_classes=numberofclass, widen_factor=10, dropRate=0.3)
+    else:
+        raise Exception('unknown network architecture: {}'.format(args.net_type))
+
+    #model = torch.nn.DataParallel(model).cuda()
     model = model.cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.lr_decay, nesterov=True)
+                                weight_decay=args.weight_decay, nesterov=True)
 
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0) # Gradient Clipping
-
-    if args.dataset == 'svhn':
-        scheduler = MultiStepLR(optimizer, milestones=[80, 120], gamma=0.1)
+    if args.resume:
+        checkpoint_path = checkpoint_path + csv_path
+        checkpoint = torch.load(checkpoint_path + 'model_best.pth.tar')
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        start_epoch = checkpoint['epoch'] + 1
+        filename = csv_path + 'log.csv'
+        csv_logger = CSVLogger(csv_path, args=args, fieldnames=['epoch', 'train_loss', 'train_err1', 'test_loss', 'test_err1', 'test_err5'], filename=filename)
     else:
-        scheduler = MultiStepLR(optimizer, milestones=[60, 120, 160, 200], gamma=0.2)
+        start_epoch = 0
+        filename = csv_path + '/' + test_id + '.csv'
+        csv_logger = CSVLogger(csv_path, args=args, fieldnames=['epoch', 'train_loss', 'train_err1', 'test_loss', 'test_err1', 'test_err5'], filename=filename)
 
-    filename = csv_path + '/' + test_id + '.csv'
-    csv_logger = CSVLogger(args=args, fieldnames=['epoch', 'train_loss', 'train_acc', 'test_loss', 'test_acc'], filename=filename)
+    print(model)
+    print('the number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
-    for epoch in range(args.epochs):
+    # define loss function (criterion) and optimizer
+    criterion = nn.CrossEntropyLoss().cuda()
+
+    for epoch in range(start_epoch, start_epoch + args.epochs):
+
+        adjust_learning_rate(args, optimizer, epoch)
+
+        # train for one epoch
+        train_loss, train_err1 = train(train_loader, model, criterion, optimizer, epoch)
+
+        # evaluate on validation set
+        err1, err5, val_loss = validate(val_loader, model, criterion, epoch)
         
-        progress_bar = tqdm(train_loader)
-        
-        train_acc, train_loss = train(progress_bar, model, criterion, optimizer, epoch)
-       
-        test_acc, test_loss = test(test_loader, model, criterion)
+        # loss
+        train_loss = '%.4f' % (train_loss)
+        train_err1 = '%.4f' % (train_err1)
 
-        summary.add_scalar('train/loss3', train_loss/len(train_loader), epoch)
-        summary.add_scalar('train/acc3', train_acc, epoch)
-        summary.add_scalar('test/loss3', test_loss, epoch)
-        summary.add_scalar('test/acc3', test_acc, epoch)
+        val_loss = '%.4f' % (val_loss)
+        test_err1 = '%.4f' % (err1)
+        test_err5 = '%.4f' % (err5)
 
-        tqdm.write('test_loss: %.3f' % (test_loss))
-        tqdm.write('test_acc: %.3f' % (test_acc))
+        # remember best prec@1 and save checkpoint
+        is_best = err1 <= best_err1
+        best_err1 = min(err1, best_err1)
+        if is_best:
+            best_err5 = err5
 
-        train_loss = '%.3f' % (train_loss/len(train_loader))
-        test_loss = '%.3f' % (test_loss)
+        print('Current best error (top-1 and 5 error):', best_err1, best_err5)
+        save_checkpoint({
+            'epoch': epoch,
+            'arch': args.net_type,
+            'state_dict': model.state_dict(),
+            'best_err1': best_err1,
+            'best_err5': best_err5,
+            'optimizer': optimizer.state_dict(),
+        }, is_best, test_id)
 
-
-        scheduler.step(epoch)
-
-        row = {'epoch': str(epoch), 'train_loss': str(train_loss), 'train_acc': str(train_acc), 'test_loss': str(test_loss), 'test_acc': str(test_acc)}
+        row = {'epoch': str(epoch), 'train_loss': str(train_loss), 'train_err1': str(train_err1), 'test_loss': str(val_loss), 'test_err1': str(test_err1), 'test_err5': str(test_err5)}
         csv_logger.writerow(row)
-    
-    save_checkpoint({
-        'epoch': epoch,
-        'arch': args.model_type,
-        'state_dict': model.state_dict(),
-        'optimizer': optimizer.state_dict()}, model_path, test_id)
+
+    print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
     csv_logger.close()
 
+def train(train_loader, model, criterion, optimizer, epoch):
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
 
-def train(progress_bar, model, criterion, optimizer, epoch):
-    xentropy_loss_avg = 0.
-    correct = 0.
-    total = 0.
+    # switch to train mode
+    model.train()
 
-    for i, (images, labels) in enumerate(progress_bar):
-        progress_bar.set_description('Epoch ' + str(epoch))
+    end = time.time()
+    current_LR = get_learning_rate(optimizer)[0]
+    for i, (input, target) in enumerate(train_loader):
+        # measure data loading time
+        data_time.update(time.time() - end)
 
-        images = images.cuda()
-        labels = labels.cuda()
-        one_hot_labels = lb.transform(labels.tolist())
-        one_hot_labels = torch.tensor(one_hot_labels)
+        input = input.cuda()
+        target = target.cuda()
 
         r = np.random.rand(1)
         if args.beta > 0 and r < args.mix_prob:
-            
+            # generate mixed sample
             is_train = True
             lam = np.random.beta(args.beta, args.beta)
-            rand_index = torch.randperm(images.size()[0]).cuda()
-
-            label_a = labels 
-            label_b = labels[rand_index]
+            rand_index = torch.randperm(input.size()[0]).cuda()
             
-            bbox = rand_bbox(images.size(), lam)
+            target_a = target
+            target_b = target[rand_index]
 
-
-            images[:, :, bbox[0]:bbox[2], bbox[1]:bbox[3]] = images[rand_index, :, bbox[0]:bbox[2], bbox[1]:bbox[3]]
-            lam = 1 - ((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / (images.size()[-1] * images.size()[-2]))
+            bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), lam)
+            input[:, :, bbx1:bbx2, bby1:bby2] = input[rand_index, :, bbx1:bbx2, bby1:bby2]
             
+            # adjust lambda to exactly match pixel ratio
+            lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
             
             # compute output
-            input_var = torch.autograd.Variable(images, requires_grad=True)
-            label_a_var = torch.autograd.Variable(label_a)
-            label_b_var = torch.autograd.Variable(label_b)
-
+            input_var = torch.autograd.Variable(input, requires_grad=True)
+            target_a_var = torch.autograd.Variable(target_a)
+            target_b_var = torch.autograd.Variable(target_b)
             output = model(input_var, is_train, rand_index, lam)
-            loss = criterion(output, label_a_var) * lam + criterion(output, label_b_var)
-
+            loss = criterion(output, target_a_var) * lam + criterion(output, target_b_var) * (1. - lam)
         else:
+            # compute output
             is_train = False
-            input_var = torch.autograd.Variable(images, requires_grad=True)
-            label_var = torch.autograd.Variable(labels)
+            input_var = torch.autograd.Variable(input, requires_grad=True)
+            target_var = torch.autograd.Variable(target)
             output = model(input_var, is_train)
-            loss = criterion(output, label_var)
-        
+            loss = criterion(output, target_var)
+
+        # measure accuracy and record loss
+        err1, err5 = accuracy(output.data, target, topk=(1, 5))
+
+        losses.update(loss.item(), input.size(0))
+        top1.update(err1.item(), input.size(0))
+        top5.update(err5.item(), input.size(0))
+
+        # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        xentropy_loss_avg += loss.item()
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
 
-        # Calculate running average of accuracy
-        output = torch.max(output.data, 1)[1]
-        total += labels.size(0)
-        correct += (output == labels.data).sum().item()
-        accuracy = correct / total
-        train_loss = xentropy_loss_avg / total
+        if i % args.print_freq == 0 and args.verbose == True:
+            print('Epoch: [{0}/{1}][{2}/{3}]\t'
+                  'LR: {LR:.6f}\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Top 1-err {top1.val:.4f} ({top1.avg:.4f})\t'
+                  'Top 5-err {top5.val:.4f} ({top5.avg:.4f})'.format(
+                epoch, args.epochs + start_epoch, i, len(train_loader), LR=current_LR, batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1, top5=top5))
 
-        progress_bar.set_postfix(xentropy='%.3f' % (xentropy_loss_avg / (i + 1)), acc='%.3f' % accuracy)
+    print('* Epoch: [{0}/{1}]\t Top 1-err {top1.avg:.3f}  Top 5-err {top5.avg:.3f}\t Train Loss {loss.avg:.3f} \n'.format(
+        epoch, args.epochs + start_epoch, top1=top1, top5=top5, loss=losses))
 
-    
-    return accuracy, xentropy_loss_avg
+    return losses.avg, top1.val
 
 
-def test(loader, model, criterion):
-    model.eval()    # Change model to 'eval' mode (BN uses moving mean/var).
-    correct = 0.
-    total = 0.
-    total_loss = 0.
-    loss = 0.
 
+
+def validate(val_loader, model, criterion, epoch):
+    batch_time = AverageMeter()
+    losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+
+    # switch to evaluate mode
+    model.eval()
     is_train = False
-    for images, labels in loader:
-        images = images.cuda()
-        labels = labels.cuda()
 
+    end = time.time()
+    for i, (input, target) in enumerate(val_loader):
+        input = input.cuda()
+        target = target.cuda()
+
+        input_var = torch.autograd.Variable(input)
+        target_var = torch.autograd.Variable(target)
         with torch.no_grad():
-            pred = model(images, is_train, 0, 0)
+            output = model(input_var, is_train)
+        loss = criterion(output, target_var)
 
-        val_loss = criterion(pred, labels)
-        loss += val_loss.item()
+        # measure accuracy and record loss
+        err1, err5 = accuracy(output.data, target, topk=(1, 5))
 
-        pred = torch.max(pred.data, 1)[1]
-        total += labels.size(0)
-        correct += (pred == labels).sum().item()
-        
-    val_acc = correct / total
-    total_loss = loss / len(loader)
-    
-    model.train()
-    return val_acc, total_loss
+        losses.update(loss.item(), input.size(0))
+
+        top1.update(err1.item(), input.size(0))
+        top5.update(err5.item(), input.size(0))
+
+        # measure elapsed time
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if i % args.print_freq == 0 and args.verbose == True:
+            print('Test (on val set): [{0}/{1}][{2}/{3}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Top 1-err {top1.val:.4f} ({top1.avg:.4f})\t'
+                  'Top 5-err {top5.val:.4f} ({top5.avg:.4f})'.format(
+                   epoch, args.epochs + start_epoch, i, len(val_loader), batch_time=batch_time, loss=losses,
+                   top1=top1, top5=top5))
+
+    print('* Epoch: [{0}/{1}]\t Top 1-err {top1.avg:.3f}  Top 5-err {top5.avg:.3f}\t Test Loss {loss.avg:.3f}'.format(
+        epoch, args.epochs + start_epoch, top1=top1, top5=top5, loss=losses))
+    return top1.avg, top5.avg, losses.avg
+
+
+
 
 
 if __name__ == '__main__':
